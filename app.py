@@ -1,15 +1,81 @@
 import os
-from groq import Groq
-import streamlit as st
+import time
+import uuid
 import json
 import re
-
-# Инициализация Groq клиента
-api_key = os.getenv("GROQ_API_KEY")
-client = Groq(api_key=api_key)
+import requests
+import streamlit as st
 
 # ======================
-# ФУНКЦИИ
+# GIGACHAT AUTHORIZATION
+# ======================
+
+CLIENT_ID = os.getenv("GIGACHAT_CLIENT_ID")
+AUTHORIZATION_KEY = os.getenv("GIGACHAT_AUTHORIZATION_KEY")
+
+if not CLIENT_ID or not AUTHORIZATION_KEY:
+    st.error("❌ Укажите GIGACHAT_CLIENT_ID и GIGACHAT_AUTHORIZATION_KEY в Environment Variables на Render")
+    st.stop()
+
+# Кэш access_token
+_access_token = None
+_token_expires_at = 0
+
+
+def get_gigachat_access_token():
+    global _access_token, _token_expires_at
+    if _access_token and time.time() < _token_expires_at - 60:
+        return _access_token
+
+    url = "https://ngw.devices.sberbank.ru:9443/api/v2/oauth"
+    headers = {
+        "Content-Type": "application/x-www-form-urlencoded",
+        "RqUID": str(uuid.uuid4()),
+        "Authorization": f"Basic {AUTHORIZATION_KEY}"
+    }
+    data = {"scope": "GIGACHAT_API_PERS"}
+
+    try:
+        response = requests.post(url, headers=headers, data=data, verify=True)
+        response.raise_for_status()
+        token_data = response.json()
+        _access_token = token_data["access_token"]
+        _token_expires_at = time.time() + token_data["expires_in"]
+        return _access_token
+    except Exception as e:
+        raise Exception(f"Ошибка получения токена: {str(e)}")
+
+
+def call_gigachat(messages, model="GigaChat-Pro", max_tokens=1024, temperature=0.7):
+    token = get_gigachat_access_token()
+    url = "https://gigachat.devices.sberbank.ru/api/v1/chat/completions"
+    payload = {
+        "model": model,
+        "messages": messages,
+        "max_tokens": max_tokens,
+        "temperature": temperature
+    }
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json"
+    }
+
+    try:
+        response = requests.post(url, headers=headers, json=payload, verify=True)
+        if response.status_code == 401:
+            global _access_token
+            _access_token = None
+            token = get_gigachat_access_token()
+            headers["Authorization"] = f"Bearer {token}"
+            response = requests.post(url, headers=headers, json=payload, verify=True)
+        response.raise_for_status()
+        return response.json()["choices"][0]["message"]["content"]
+    except Exception as e:
+        raise Exception(f"GigaChat API ошибка: {str(e)}")
+
+
+# ======================
+# BOT FUNCTIONS
 # ======================
 
 def create_test(topic: str, explained_content: str, num_questions: int = 5, user_profile: dict = None):
@@ -35,18 +101,16 @@ def create_test(topic: str, explained_content: str, num_questions: int = 5, user
     {explained_content}
 
     Вопросы должны проверять понимание ЭТОГО МАТЕРИАЛА.
-    НЕ задавай общие вопросы о математике, науке или этом приложении.
+    НЕ задавай общие вопросы.
 
-    ВАЖНО: Ответь ТОЛЬКО валидным JSON без дополнительного текста.
-
-    Формат:
+    Ответь СТРОГО в формате JSON:
     {{
         "questions": [
             {{
                 "text": "текст вопроса",
                 "options": ["вариант 1", "вариант 2", "вариант 3", "вариант 4"],
                 "correct_answer": 0,
-                "hint": "подсказка для этого вопроса",
+                "hint": "подсказка",
                 "explanation": "почему этот ответ правильный"
             }}
         ]
@@ -54,21 +118,21 @@ def create_test(topic: str, explained_content: str, num_questions: int = 5, user
 
     for attempt in range(2):
         try:
-            response = client.chat.completions.create(
+            raw_content = call_gigachat(
                 messages=[{"role": "user", "content": prompt}],
-                model="llama-3.3-70b-versatile",
-                response_format={"type": "json_object"},
+                model="GigaChat-Pro",
+                max_tokens=1000,
+                temperature=0.3
             )
-            raw_content = response.choices[0].message.content
-            json.loads(raw_content)
-            return raw_content
-        except json.JSONDecodeError:
+            raw_content = re.sub(r'^```json\s*|\s*```$', '', raw_content.strip(), flags=re.MULTILINE)
+            parsed = json.loads(raw_content)
+            return json.dumps(parsed, ensure_ascii=False)
+        except (json.JSONDecodeError, Exception) as e:
             if attempt == 0:
-                prompt += "\n\nОШИБКА: предыдущий ответ не был валидным JSON. Ответь СТРОГО по формату."
+                prompt += "\n\nОТВЕЧАЙ ТОЛЬКО ВАЛИДНЫМ JSON БЕЗ ЛЮБОГО ДРУГОГО ТЕКСТА."
                 continue
             else:
-                raise Exception("LLM дважды вернул невалидный JSON")
-    raise Exception("Не удалось получить валидный ответ от LLM")
+                raise Exception(f"Не удалось получить валидный JSON: {str(e)}")
 
 
 def get_ai_response(messages, user_profile: dict = None):
@@ -90,11 +154,12 @@ def get_ai_response(messages, user_profile: dict = None):
     if len(messages_for_api) > 6:
         messages_for_api = [messages_for_api[0]] + messages_for_api[-5:]
 
-    response = client.chat.completions.create(
-        model="llama-3.3-70b-versatile",
-        messages=messages_for_api
+    return call_gigachat(
+        messages=messages_for_api,
+        model="GigaChat-Pro",
+        max_tokens=800,
+        temperature=0.6
     )
-    return response.choices[0].message.content
 
 
 def wants_test(user_input):
@@ -121,7 +186,7 @@ def wants_error_review(user_input):
 
 
 # ======================
-# ИНИЦИАЛИЗАЦИЯ СОСТОЯНИЯ
+# STREAMLIT APP
 # ======================
 
 if 'messages' not in st.session_state:
@@ -154,7 +219,6 @@ if 'session_test_scores' not in st.session_state:
     st.session_state.session_test_scores = []
 
 
-# === СТАРТОВОЕ СООБЩЕНИЕ ===
 if len(st.session_state.messages) == 1:
     welcome_msg = (
         "👋 Привет! Я — ваш ИИ-помощник по обучению.\n\n"
@@ -173,10 +237,7 @@ st.title("🎓 Обучающий чат с ИИ-тестированием")
 st.caption("Создано Хайруллиным Р.Р.")
 
 
-# ======================
-# БОКОВАЯ ПАНЕЛЬ
-# ======================
-
+# Sidebar
 with st.sidebar:
     st.header("👤 Профиль")
     with st.expander("Заполнить анкету", expanded=False):
@@ -238,10 +299,6 @@ with st.sidebar:
         st.session_state.session_test_scores = []
         st.rerun()
 
-
-# ======================
-# ФУНКЦИЯ ОТОБРАЖЕНИЯ ТЕСТА
-# ======================
 
 def display_test(test_data_str, message_index):
     try:
@@ -354,10 +411,7 @@ def display_test(test_data_str, message_index):
             st.warning("📚 Не расстраивайтесь! Напишите 'разбери ошибки' для подробного объяснения.")
 
 
-# ======================
-# ОТОБРАЖЕНИЕ ИСТОРИИ
-# ======================
-
+# Display chat history
 for idx, msg in enumerate(st.session_state.messages):
     if msg['role'] == 'system':
         continue
@@ -373,10 +427,7 @@ for idx, msg in enumerate(st.session_state.messages):
             display_test(msg['test_data'], idx)
 
 
-# ======================
-# ОБРАБОТКА ВВОДА
-# ======================
-
+# Handle user input
 user_input = st.chat_input("Например: «тест по квадратным уравнениям»...")
 
 if user_input:
@@ -384,7 +435,6 @@ if user_input:
     with st.chat_message("user"):
         st.write(user_input)
 
-    # === ОБРАБОТКА ЗАПРОСА НА ТЕСТ ===
     is_test_request, requested_topic = wants_test(user_input)
 
     if is_test_request:
@@ -392,15 +442,12 @@ if user_input:
             with st.spinner("🧠 Создаю тест..."):
                 try:
                     if requested_topic:
-                        # Получаем объяснение по новой теме
                         explanation_prompt = f"Кратко объясни тему '{requested_topic}' для школьника. Дай определения и формулы. Не задавай вопросов."
                         explanation_messages = [
                             {"role": "system", "content": "Ты учитель. Объясняй чётко."},
                             {"role": "user", "content": explanation_prompt}
                         ]
                         explained_content = get_ai_response(explanation_messages)
-
-                        # Генерируем тест на основе этого объяснения
                         test_result = create_test(
                             topic=requested_topic,
                             explained_content=explained_content,
@@ -415,7 +462,6 @@ if user_input:
                         st.rerun()
 
                     elif st.session_state.last_explanation:
-                        # Используем существующее объяснение
                         test_result = create_test(
                             topic=st.session_state.last_topic or "общая тема",
                             explained_content=st.session_state.last_explanation,
@@ -437,7 +483,6 @@ if user_input:
                     st.error(error_msg)
                     st.session_state.messages.append({"role": "assistant", "content": error_msg})
 
-    # === РАЗБОР ОШИБОК ===
     elif wants_error_review(user_input) and st.session_state.last_test_result:
         test_result = st.session_state.last_test_result
         test_data = test_result['test_data']
@@ -483,7 +528,6 @@ if user_input:
                 st.write(msg)
             st.session_state.messages.append({"role": "assistant", "content": msg})
 
-    # === ОБЫЧНЫЙ ЧАТ ===
     else:
         with st.chat_message("assistant"):
             with st.spinner("💭 Думаю..."):
