@@ -11,14 +11,17 @@ from queue import Queue
 import hashlib
 
 # ======================
-# GIGACHAT AUTH
+# КОНФИГУРАЦИЯ
 # ======================
+
+# (доступные: GigaChat, GigaChat-Lite, GigaChat-Pro)
+MODEL = "GigaChat-Pro"
 
 CLIENT_ID = os.getenv("GIGACHAT_CLIENT_ID")
 CLIENT_SECRET = os.getenv("GIGACHAT_CLIENT_SECRET")
 
 if not CLIENT_ID or not CLIENT_SECRET:
-    st.error("❌ Укажите GIGACHAT_CLIENT_ID и GIGACHAT_CLIENT_SECRET в Secrets")
+    st.error("Укажите GIGACHAT_CLIENT_ID и GIGACHAT_CLIENT_SECRET в Secrets")
     st.stop()
 
 # Кэш access_token
@@ -31,30 +34,25 @@ _token_expires_at = 0
 class GigaChatQueue:
     """Очередь запросов для ограничения 1 одновременного запроса"""
     def __init__(self):
-        self.request_queue = Queue()  # Очередь запросов
-        self.result_dict = {}  # Словарь результатов {request_id: result}
+        self.request_queue = Queue()
+        self.result_dict = {}
         self.current_id = 0
         self.lock = threading.Lock()
-        self.processing = False
         self.worker_thread = None
         self.start_worker()
 
     def start_worker(self):
-        """Запускает рабочий поток для обработки очереди"""
         if self.worker_thread is None or not self.worker_thread.is_alive():
             self.worker_thread = threading.Thread(target=self._queue_worker, daemon=True)
             self.worker_thread.start()
 
     def add_request(self, func, *args, **kwargs):
-        """Добавляет запрос в очередь и возвращает результат"""
         with self.lock:
             request_id = self.current_id
             self.current_id += 1
 
-        # Добавляем запрос в очередь
         self.request_queue.put((request_id, func, args, kwargs))
 
-        # Ждем результат (с таймаутом 60 секунд)
         start_time = time.time()
         while time.time() - start_time < 60:
             with self.lock:
@@ -68,28 +66,20 @@ class GigaChatQueue:
         raise TimeoutError("Таймаут ожидания ответа от GigaChat")
 
     def _queue_worker(self):
-        """Рабочий поток, обрабатывающий очередь"""
         while True:
-            # Берем запрос из очереди
             request_id, func, args, kwargs = self.request_queue.get()
 
             try:
-                # Выполняем запрос
                 result = func(*args, **kwargs)
             except Exception as e:
                 result = e
 
-            # Сохраняем результат
             with self.lock:
                 self.result_dict[request_id] = result
 
-            # Помечаем задачу как выполненную
             self.request_queue.task_done()
-
-            # Небольшая пауза между запросами
             time.sleep(0.1)
 
-# Создаем глобальную очередь
 gigachat_queue = GigaChatQueue()
 
 # ======================
@@ -99,7 +89,6 @@ response_cache = {}
 cache_lock = threading.Lock()
 
 def get_cache_key(messages, model, max_tokens, temperature):
-    """Создает ключ для кэша"""
     content = json.dumps(messages, sort_keys=True) + model + str(max_tokens) + str(temperature)
     return hashlib.md5(content.encode()).hexdigest()
 
@@ -107,7 +96,6 @@ def get_cache_key(messages, model, max_tokens, temperature):
 # GIGACHAT ФУНКЦИИ
 # ======================
 def get_gigachat_access_token():
-    """Получает access_token с использованием client_id + client_secret."""
     global _access_token, _token_expires_at
 
     if _access_token and time.time() < _token_expires_at - 60:
@@ -130,18 +118,12 @@ def get_gigachat_access_token():
         response.raise_for_status()
         token_data = response.json()
         _access_token = token_data["access_token"]
-
-        if "expires_at" in token_data:
-            _token_expires_at = token_data["expires_at"]
-        else:
-            _token_expires_at = time.time() + 1800
-
+        _token_expires_at = token_data.get("expires_at", time.time() + 1800)
         return _access_token
     except Exception as e:
         raise Exception(f"Ошибка получения токена: {str(e)}")
 
-def call_gigachat_direct(messages, model="GigaChat-Max", max_tokens=1024, temperature=0.7):
-    """Прямой вызов GigaChat API (без очереди)"""
+def call_gigachat_direct(messages, model=MODEL, max_tokens=1024, temperature=0.7):
     token = get_gigachat_access_token()
     url = "https://gigachat.devices.sberbank.ru/api/v1/chat/completions"
     payload = {
@@ -169,19 +151,15 @@ def call_gigachat_direct(messages, model="GigaChat-Max", max_tokens=1024, temper
         response.raise_for_status()
         result = response.json()
         return result["choices"][0]["message"]["content"]
-
     except Exception as e:
         raise Exception(f"GigaChat API ошибка: {str(e)}")
 
-def call_gigachat(messages, model="GigaChat-Max", max_tokens=1024, temperature=0.7):
-    """Вызов GigaChat через очередь с кэшированием"""
-    # Проверяем кэш
+def call_gigachat(messages, model=MODEL, max_tokens=1024, temperature=0.7):
     cache_key = get_cache_key(messages, model, max_tokens, temperature)
     with cache_lock:
         if cache_key in response_cache:
             return response_cache[cache_key]
 
-    # Если нет в кэше, добавляем в очередь
     result = gigachat_queue.add_request(
         call_gigachat_direct,
         messages,
@@ -190,7 +168,6 @@ def call_gigachat(messages, model="GigaChat-Max", max_tokens=1024, temperature=0
         temperature
     )
 
-    # Сохраняем в кэш (только успешные ответы)
     if not isinstance(result, Exception):
         with cache_lock:
             response_cache[cache_key] = result
@@ -201,15 +178,14 @@ def call_gigachat(messages, model="GigaChat-Max", max_tokens=1024, temperature=0
 # BOT FUNCTIONS
 # ======================
 def create_test(topic: str, explained_content: str, num_questions: int = 5, user_profile: dict = None):
-    profile_str = ""
+    profile_parts = []
     if user_profile:
-        parts = []
-        if user_profile.get("level"): parts.append(f"уровень: {user_profile['level']}")
-        if user_profile.get("goal"): parts.append(f"цель: {user_profile['goal']}")
-        if user_profile.get("style"): parts.append(f"стиль: {user_profile['style']}")
-        if user_profile.get("subject"): parts.append(f"предмет: {user_profile['subject']}")
-        if parts:
-            profile_str = f"\nУчёт профиля пользователя: {'; '.join(parts)}."
+        if user_profile.get("level"): profile_parts.append(f"уровень: {user_profile['level']}")
+        if user_profile.get("goal"): profile_parts.append(f"цель: {user_profile['goal']}")
+        if user_profile.get("style"): profile_parts.append(f"стиль: {user_profile['style']}")
+        if user_profile.get("subject"): profile_parts.append(f"предмет: {user_profile['subject']}")
+
+    profile_str = f"\nУчёт профиля пользователя: {'; '.join(profile_parts)}." if profile_parts else ""
 
     difficulty = ""
     if user_profile and user_profile.get("goal") == "олимпиады":
@@ -219,30 +195,30 @@ def create_test(topic: str, explained_content: str, num_questions: int = 5, user
 
     prompt = f"""Создай тест по теме '{topic}' с {num_questions} вопросами.{profile_str}{difficulty}
 
-    Материал для теста:
-    {explained_content}
+Материал для теста:
+{explained_content}
 
-    Вопросы должны проверять понимание ЭТОГО МАТЕРИАЛА.
-    НЕ задавай общие вопросы.
+Вопросы должны проверять понимание ЭТОГО МАТЕРИАЛА.
+НЕ задавай общие вопросы.
 
-    Ответь СТРОГО в формате JSON:
-    {{
-        "questions": [
-            {{
-                "text": "текст вопроса",
-                "options": ["вариант 1", "вариант 2", "вариант 3", "вариант 4"],
-                "correct_answer": 0,
-                "hint": "подсказка",
-                "explanation": "почему этот ответ правильный"
-            }}
-        ]
-    }}"""
+Ответь СТРОГО в формате JSON:
+{{
+    "questions": [
+        {{
+            "text": "текст вопроса",
+            "options": ["вариант 1", "вариант 2", "вариант 3", "вариант 4"],
+            "correct_answer": 0,
+            "hint": "подсказка",
+            "explanation": "почему этот ответ правильный"
+        }}
+    ]
+}}"""
 
     for attempt in range(2):
         try:
             raw_content = call_gigachat(
                 messages=[{"role": "user", "content": prompt}],
-                model="GigaChat-Max",
+                model=MODEL,
                 max_tokens=1000,
                 temperature=0.3
             )
@@ -260,15 +236,17 @@ def get_ai_response(messages, user_profile: dict = None):
     messages_for_api = []
     for msg in messages:
         if msg["role"] == "user" and user_profile:
-            content = msg["content"]
             parts = []
             if user_profile.get("level"): parts.append(f"уровень: {user_profile['level']}")
             if user_profile.get("goal"): parts.append(f"цель: {user_profile['goal']}")
             if user_profile.get("style"): parts.append(f"стиль: {user_profile['style']}")
             if user_profile.get("subject"): parts.append(f"предмет: {user_profile['subject']}")
+
             if parts:
-                content += f"\n\n[Профиль: {'; '.join(parts)}]"
-            messages_for_api.append({"role": msg["role"], "content": content})
+                content = msg["content"] + f"\n\n[Профиль: {'; '.join(parts)}]"
+                messages_for_api.append({"role": msg["role"], "content": content})
+            else:
+                messages_for_api.append(msg)
         else:
             messages_for_api.append(msg)
 
@@ -277,7 +255,7 @@ def get_ai_response(messages, user_profile: dict = None):
 
     return call_gigachat(
         messages=messages_for_api,
-        model="GigaChat-Max",
+        model=MODEL,
         max_tokens=800,
         temperature=0.6
     )
@@ -306,7 +284,6 @@ def wants_error_review(user_input):
 # ======================
 # STREAMLIT APP
 # ======================
-
 if 'messages' not in st.session_state:
     st.session_state.messages = [{
         "role": "system",
@@ -318,23 +295,19 @@ if 'messages' not in st.session_state:
 - Будь поддерживающим и мотивируй на обучение."""
     }]
 
-if 'last_test_result' not in st.session_state:
-    st.session_state.last_test_result = None
+# Инициализация session state переменных
+session_vars = {
+    'last_test_result': None,
+    'last_topic': None,
+    'last_explanation': None,
+    'test_in_progress': False,
+    'user_profile': {},
+    'session_test_scores': []
+}
 
-if 'last_topic' not in st.session_state:
-    st.session_state.last_topic = None
-
-if 'last_explanation' not in st.session_state:
-    st.session_state.last_explanation = None
-
-if 'test_in_progress' not in st.session_state:
-    st.session_state.test_in_progress = False
-
-if 'user_profile' not in st.session_state:
-    st.session_state.user_profile = {}
-
-if 'session_test_scores' not in st.session_state:
-    st.session_state.session_test_scores = []
+for var, default in session_vars.items():
+    if var not in st.session_state:
+        st.session_state[var] = default
 
 if len(st.session_state.messages) == 1:
     welcome_msg = (
@@ -343,16 +316,15 @@ if len(st.session_state.messages) == 1:
         "Или сразу запросите тест: «тест по тригонометрии».\n\n"
         "Заполните анкету в боковой панели, чтобы адаптировать уровень 👈"
     )
-    st.session_state.messages.append({
-        "role": "assistant",
-        "content": welcome_msg
-    })
+    st.session_state.messages.append({"role": "assistant", "content": welcome_msg})
 
 st.set_page_config(page_title="Обучающий чат", page_icon="🎓", layout="centered")
 st.title("🎓 Обучающий чат с ИИ-тестированием")
-st.caption("Создано Хайруллиным Р.Р.")
+st.caption(f"Создано Хайруллиным Р.Р. | Модель: {MODEL}")
 
-# Sidebar
+# ======================
+# SIDEBAR
+# ======================
 with st.sidebar:
     st.header("👤 Профиль")
     with st.expander("Заполнить анкету", expanded=False):
@@ -408,13 +380,15 @@ with st.sidebar:
     st.divider()
     if st.button("🔄 Новый чат", use_container_width=True):
         st.session_state.messages = [st.session_state.messages[0]]
-        st.session_state.last_test_result = None
-        st.session_state.last_topic = None
-        st.session_state.last_explanation = None
+        for var in ['last_test_result', 'last_topic', 'last_explanation']:
+            st.session_state[var] = None
         st.session_state.test_in_progress = False
         st.session_state.session_test_scores = []
         st.rerun()
 
+# ======================
+# DISPLAY TEST FUNCTION
+# ======================
 def display_test(test_data_str, message_index):
     try:
         test_data = json.loads(test_data_str) if isinstance(test_data_str, str) else test_data_str
@@ -431,12 +405,9 @@ def display_test(test_data_str, message_index):
     submitted_key = f"submitted_{message_index}"
     hints_used_key = f"hints_{message_index}"
 
-    if answers_key not in st.session_state:
-        st.session_state[answers_key] = {}
-    if submitted_key not in st.session_state:
-        st.session_state[submitted_key] = False
-    if hints_used_key not in st.session_state:
-        st.session_state[hints_used_key] = set()
+    for key in [answers_key, submitted_key, hints_used_key]:
+        if key not in st.session_state:
+            st.session_state[key] = {} if key == answers_key else False if key == submitted_key else set()
 
     if not st.session_state[submitted_key]:
         st.subheader("📝 Тест")
@@ -525,7 +496,9 @@ def display_test(test_data_str, message_index):
         else:
             st.warning("📚 Не расстраивайтесь! Напишите 'разбери ошибки' для подробного объяснения.")
 
-# Display chat history
+# ======================
+# DISPLAY CHAT HISTORY
+# ======================
 for idx, msg in enumerate(st.session_state.messages):
     if msg['role'] == 'system':
         continue
@@ -540,7 +513,9 @@ for idx, msg in enumerate(st.session_state.messages):
         with st.chat_message('assistant'):
             display_test(msg['test_data'], idx)
 
-# Handle user input
+# ======================
+# HANDLE USER INPUT
+# ======================
 user_input = st.chat_input("Например: «тест по квадратным уравнениям»...")
 
 if user_input:
@@ -556,11 +531,10 @@ if user_input:
                 try:
                     if requested_topic:
                         explanation_prompt = f"Кратко объясни тему '{requested_topic}' для школьника. Дай определения и формулы. Не задавай вопросов."
-                        explanation_messages = [
+                        explained_content = get_ai_response([
                             {"role": "system", "content": "Ты учитель. Объясняй чётко."},
                             {"role": "user", "content": explanation_prompt}
-                        ]
-                        explained_content = get_ai_response(explanation_messages)
+                        ])
                         test_result = create_test(
                             topic=requested_topic,
                             explained_content=explained_content,
@@ -614,10 +588,7 @@ if user_input:
                 })
 
         if errors_info:
-            explanation_request = (
-                "Проанализируй ошибки пользователя и построй **мини-урок по типам ошибок**. "
-                "Сгруппируй вопросы по общим темам и дай общие рекомендации. Не пересказывай объяснения из теста!\n\nОшибки:\n"
-            )
+            explanation_request = "Проанализируй ошибки пользователя и построй **мини-урок по типам ошибок**. Сгруппируй вопросы по общим темам и дай общие рекомендации. Не пересказывай объяснения из теста!\n\nОшибки:\n"
             for i, error in enumerate(errors_info, 1):
                 explanation_request += f"{i}. Вопрос: {error['question']}\n"
                 explanation_request += f"   Неправильный ответ: {error['user_answer']}\n"
@@ -626,11 +597,10 @@ if user_input:
             with st.chat_message("assistant"):
                 with st.spinner("📚 Анализирую ошибки..."):
                     try:
-                        messages_for_api = [
+                        response = get_ai_response([
                             {"role": "system", "content": "Ты эксперт-педагог. Объясняй ошибки структурированно."},
                             {"role": "user", "content": explanation_request}
-                        ]
-                        response = get_ai_response(messages_for_api, st.session_state.user_profile)
+                        ], st.session_state.user_profile)
                         st.write(response)
                         st.session_state.messages.append({"role": "assistant", "content": response})
                     except Exception as e:
