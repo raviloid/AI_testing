@@ -3,18 +3,19 @@ import time
 import uuid
 import json
 import re
+import base64
 import requests
 import streamlit as st
 
 # ======================
-# GIGACHAT AUTHORIZATION
+# GIGACHAT AUTH (Client ID + Client Secret)
 # ======================
 
 CLIENT_ID = os.getenv("GIGACHAT_CLIENT_ID")
-AUTHORIZATION_KEY = os.getenv("GIGACHAT_AUTHORIZATION_KEY")
+CLIENT_SECRET = os.getenv("GIGACHAT_CLIENT_SECRET")
 
-if not CLIENT_ID or not AUTHORIZATION_KEY:
-    st.error("❌ Укажите GIGACHAT_CLIENT_ID и GIGACHAT_AUTHORIZATION_KEY в Environment Variables на Render")
+if not CLIENT_ID or not CLIENT_SECRET:
+    st.error("❌ Укажите GIGACHAT_CLIENT_ID и GIGACHAT_CLIENT_SECRET в Secrets (Replit) или Environment Variables (Render)")
     st.stop()
 
 # Кэш access_token
@@ -23,30 +24,44 @@ _token_expires_at = 0
 
 
 def get_gigachat_access_token():
+    """Получает access_token с использованием client_id + client_secret."""
     global _access_token, _token_expires_at
+
     if _access_token and time.time() < _token_expires_at - 60:
         return _access_token
+
+    # Формируем base64(client_id:client_secret)
+    credentials = f"{CLIENT_ID}:{CLIENT_SECRET}"
+    encoded_credentials = base64.b64encode(credentials.encode('utf-8')).decode('utf-8')
 
     url = "https://ngw.devices.sberbank.ru:9443/api/v2/oauth"
     headers = {
         "Content-Type": "application/x-www-form-urlencoded",
+        "Accept": "application/json",
         "RqUID": str(uuid.uuid4()),
-        "Authorization": f"Basic {AUTHORIZATION_KEY}"
+        "Authorization": f"Basic {encoded_credentials}"
     }
-    data = {"scope": "GIGACHAT_API_PERS"}
+    data = {"scope": "GIGACHAT_API_PERS"}  # PERS для физических лиц
 
     try:
-        response = requests.post(url, headers=headers, data=data, verify=True)
+        response = requests.post(url, headers=headers, data=data, verify=False, timeout=30)
         response.raise_for_status()
         token_data = response.json()
         _access_token = token_data["access_token"]
-        _token_expires_at = time.time() + token_data["expires_in"]
+
+        # Используем expires_at из ответа или 30 минут по умолчанию
+        if "expires_at" in token_data:
+            _token_expires_at = token_data["expires_at"]
+        else:
+            _token_expires_at = time.time() + 1750  # 30 минут
+
         return _access_token
     except Exception as e:
         raise Exception(f"Ошибка получения токена: {str(e)}")
 
 
 def call_gigachat(messages, model="GigaChat-Pro", max_tokens=1024, temperature=0.7):
+    """Выполняет запрос к GigaChat API."""
     token = get_gigachat_access_token()
     url = "https://gigachat.devices.sberbank.ru/api/v1/chat/completions"
     payload = {
@@ -57,25 +72,32 @@ def call_gigachat(messages, model="GigaChat-Pro", max_tokens=1024, temperature=0
     }
     headers = {
         "Authorization": f"Bearer {token}",
-        "Content-Type": "application/json"
+        "Content-Type": "application/json",
+        "Accept": "application/json"
     }
 
     try:
-        response = requests.post(url, headers=headers, json=payload, verify=True)
+        response = requests.post(url, headers=headers, json=payload, verify=False, timeout=60)
+
         if response.status_code == 401:
+            # Токен протух — обновляем
             global _access_token
             _access_token = None
             token = get_gigachat_access_token()
             headers["Authorization"] = f"Bearer {token}"
-            response = requests.post(url, headers=headers, json=payload, verify=True)
+            response = requests.post(url, headers=headers, json=payload, verify=False)
+
         response.raise_for_status()
-        return response.json()["choices"][0]["message"]["content"]
+
+        result = response.json()
+        return result["choices"][0]["message"]["content"]
+
     except Exception as e:
         raise Exception(f"GigaChat API ошибка: {str(e)}")
 
 
 # ======================
-# BOT FUNCTIONS
+# BOT FUNCTIONS (без изменений)
 # ======================
 
 def create_test(topic: str, explained_content: str, num_questions: int = 5, user_profile: dict = None):
