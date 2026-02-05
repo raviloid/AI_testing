@@ -6,23 +6,106 @@ import re
 import base64
 import requests
 import streamlit as st
+import threading
+from queue import Queue
+import hashlib
 
 # ======================
-# GIGACHAT AUTH (Client ID + Client Secret)
+# GIGACHAT AUTH
 # ======================
 
 CLIENT_ID = os.getenv("GIGACHAT_CLIENT_ID")
 CLIENT_SECRET = os.getenv("GIGACHAT_CLIENT_SECRET")
 
 if not CLIENT_ID or not CLIENT_SECRET:
-    st.error("❌ Укажите GIGACHAT_CLIENT_ID и GIGACHAT_CLIENT_SECRET в Secrets (Replit) или Environment Variables (Render)")
+    st.error("❌ Укажите GIGACHAT_CLIENT_ID и GIGACHAT_CLIENT_SECRET в Secrets")
     st.stop()
 
 # Кэш access_token
 _access_token = None
 _token_expires_at = 0
 
+# ======================
+# ОЧЕРЕДЬ ЗАПРОСОВ
+# ======================
+class GigaChatQueue:
+    """Очередь запросов для ограничения 1 одновременного запроса"""
+    def __init__(self):
+        self.request_queue = Queue()  # Очередь запросов
+        self.result_dict = {}  # Словарь результатов {request_id: result}
+        self.current_id = 0
+        self.lock = threading.Lock()
+        self.processing = False
+        self.worker_thread = None
+        self.start_worker()
 
+    def start_worker(self):
+        """Запускает рабочий поток для обработки очереди"""
+        if self.worker_thread is None or not self.worker_thread.is_alive():
+            self.worker_thread = threading.Thread(target=self._queue_worker, daemon=True)
+            self.worker_thread.start()
+
+    def add_request(self, func, *args, **kwargs):
+        """Добавляет запрос в очередь и возвращает результат"""
+        with self.lock:
+            request_id = self.current_id
+            self.current_id += 1
+
+        # Добавляем запрос в очередь
+        self.request_queue.put((request_id, func, args, kwargs))
+
+        # Ждем результат (с таймаутом 60 секунд)
+        start_time = time.time()
+        while time.time() - start_time < 60:
+            with self.lock:
+                if request_id in self.result_dict:
+                    result = self.result_dict.pop(request_id)
+                    if isinstance(result, Exception):
+                        raise result
+                    return result
+            time.sleep(0.1)
+
+        raise TimeoutError("Таймаут ожидания ответа от GigaChat")
+
+    def _queue_worker(self):
+        """Рабочий поток, обрабатывающий очередь"""
+        while True:
+            # Берем запрос из очереди
+            request_id, func, args, kwargs = self.request_queue.get()
+
+            try:
+                # Выполняем запрос
+                result = func(*args, **kwargs)
+            except Exception as e:
+                result = e
+
+            # Сохраняем результат
+            with self.lock:
+                self.result_dict[request_id] = result
+
+            # Помечаем задачу как выполненную
+            self.request_queue.task_done()
+
+            # Небольшая пауза между запросами
+            time.sleep(0.1)
+
+# Создаем глобальную очередь
+gigachat_queue = GigaChatQueue()
+
+# ======================
+# КЭШИРОВАНИЕ ОТВЕТОВ
+# ======================
+response_cache = {}
+cache_lock = threading.Lock()
+
+def get_cache_key(messages, model, max_tokens, temperature):
+    """Создает ключ для кэша"""
+    content = json.dumps(messages, sort_keys=True) + model + str(max_tokens) + str(temperature)
+    return hashlib.md5(content.encode()).hexdigest()
+
+# ======================
+# GIGACHAT ФУНКЦИИ
+# ======================
 def get_gigachat_access_token():
     """Получает access_token с использованием client_id + client_secret."""
     global _access_token, _token_expires_at
@@ -30,7 +113,6 @@ def get_gigachat_access_token():
     if _access_token and time.time() < _token_expires_at - 60:
         return _access_token
 
-    # Формируем base64(client_id:client_secret)
     credentials = f"{CLIENT_ID}:{CLIENT_SECRET}"
     encoded_credentials = base64.b64encode(credentials.encode('utf-8')).decode('utf-8')
 
@@ -41,7 +123,7 @@ def get_gigachat_access_token():
         "RqUID": str(uuid.uuid4()),
         "Authorization": f"Basic {encoded_credentials}"
     }
-    data = {"scope": "GIGACHAT_API_PERS"}  # PERS для физических лиц
+    data = {"scope": "GIGACHAT_API_PERS"}
 
     try:
         response = requests.post(url, headers=headers, data=data, verify=False, timeout=30)
@@ -49,19 +131,17 @@ def get_gigachat_access_token():
         token_data = response.json()
         _access_token = token_data["access_token"]
 
-        # Используем expires_at из ответа или 30 минут по умолчанию
         if "expires_at" in token_data:
             _token_expires_at = token_data["expires_at"]
         else:
-            _token_expires_at = time.time() + 1750  # 30 минут
+            _token_expires_at = time.time() + 1800
 
         return _access_token
     except Exception as e:
         raise Exception(f"Ошибка получения токена: {str(e)}")
 
-
-def call_gigachat(messages, model="GigaChat-Pro", max_tokens=1024, temperature=0.7):
-    """Выполняет запрос к GigaChat API."""
+def call_gigachat_direct(messages, model="GigaChat-Max", max_tokens=1024, temperature=0.7):
+    """Прямой вызов GigaChat API (без очереди)"""
     token = get_gigachat_access_token()
     url = "https://gigachat.devices.sberbank.ru/api/v1/chat/completions"
     payload = {
@@ -80,7 +160,6 @@ def call_gigachat(messages, model="GigaChat-Pro", max_tokens=1024, temperature=0
         response = requests.post(url, headers=headers, json=payload, verify=False, timeout=60)
 
         if response.status_code == 401:
-            # Токен протух — обновляем
             global _access_token
             _access_token = None
             token = get_gigachat_access_token()
@@ -88,18 +167,39 @@ def call_gigachat(messages, model="GigaChat-Pro", max_tokens=1024, temperature=0
             response = requests.post(url, headers=headers, json=payload, verify=False)
 
         response.raise_for_status()
-
         result = response.json()
         return result["choices"][0]["message"]["content"]
 
     except Exception as e:
         raise Exception(f"GigaChat API ошибка: {str(e)}")
 
+def call_gigachat(messages, model="GigaChat-Max", max_tokens=1024, temperature=0.7):
+    """Вызов GigaChat через очередь с кэшированием"""
+    # Проверяем кэш
+    cache_key = get_cache_key(messages, model, max_tokens, temperature)
+    with cache_lock:
+        if cache_key in response_cache:
+            return response_cache[cache_key]
+
+    # Если нет в кэше, добавляем в очередь
+    result = gigachat_queue.add_request(
+        call_gigachat_direct,
+        messages,
+        model,
+        max_tokens,
+        temperature
+    )
+
+    # Сохраняем в кэш (только успешные ответы)
+    if not isinstance(result, Exception):
+        with cache_lock:
+            response_cache[cache_key] = result
+
+    return result
 
 # ======================
-# BOT FUNCTIONS (без изменений)
+# BOT FUNCTIONS
 # ======================
-
 def create_test(topic: str, explained_content: str, num_questions: int = 5, user_profile: dict = None):
     profile_str = ""
     if user_profile:
@@ -142,7 +242,7 @@ def create_test(topic: str, explained_content: str, num_questions: int = 5, user
         try:
             raw_content = call_gigachat(
                 messages=[{"role": "user", "content": prompt}],
-                model="GigaChat-Pro",
+                model="GigaChat-Max",
                 max_tokens=1000,
                 temperature=0.3
             )
@@ -155,7 +255,6 @@ def create_test(topic: str, explained_content: str, num_questions: int = 5, user
                 continue
             else:
                 raise Exception(f"Не удалось получить валидный JSON: {str(e)}")
-
 
 def get_ai_response(messages, user_profile: dict = None):
     messages_for_api = []
@@ -178,11 +277,10 @@ def get_ai_response(messages, user_profile: dict = None):
 
     return call_gigachat(
         messages=messages_for_api,
-        model="GigaChat-Pro",
+        model="GigaChat-Max",
         max_tokens=800,
         temperature=0.6
     )
-
 
 def wants_test(user_input):
     user_lower = user_input.lower().strip()
@@ -201,11 +299,9 @@ def wants_test(user_input):
 
     return False, None
 
-
 def wants_error_review(user_input):
     review_keywords = ['разбер', 'ошибк', 'неправильн', 'объясни', 'почему']
     return any(keyword in user_input.lower() for keyword in review_keywords)
-
 
 # ======================
 # STREAMLIT APP
@@ -240,11 +336,10 @@ if 'user_profile' not in st.session_state:
 if 'session_test_scores' not in st.session_state:
     st.session_state.session_test_scores = []
 
-
 if len(st.session_state.messages) == 1:
     welcome_msg = (
         "👋 Привет! Я — ваш ИИ-помощник по обучению.\n\n"
-        "Напишите тему, которую хотите разобрать, — например, «производная», «законы Ньютона».\n\n"
+        "Напишите тему, которую хотите разобрать — например, «производная», «законы Ньютона».\n\n"
         "Или сразу запросите тест: «тест по тригонометрии».\n\n"
         "Заполните анкету в боковой панели, чтобы адаптировать уровень 👈"
     )
@@ -253,11 +348,9 @@ if len(st.session_state.messages) == 1:
         "content": welcome_msg
     })
 
-
 st.set_page_config(page_title="Обучающий чат", page_icon="🎓", layout="centered")
 st.title("🎓 Обучающий чат с ИИ-тестированием")
 st.caption("Создано Хайруллиным Р.Р.")
-
 
 # Sidebar
 with st.sidebar:
@@ -281,6 +374,7 @@ with st.sidebar:
     st.header("⚙️ Настройки теста")
     num_questions = st.slider("Количество вопросов", 3, 10, 5)
     show_hints = st.checkbox("Показывать подсказки", value=True)
+
     st.divider()
 
     if st.session_state.last_test_result:
@@ -320,7 +414,6 @@ with st.sidebar:
         st.session_state.test_in_progress = False
         st.session_state.session_test_scores = []
         st.rerun()
-
 
 def display_test(test_data_str, message_index):
     try:
@@ -432,7 +525,6 @@ def display_test(test_data_str, message_index):
         else:
             st.warning("📚 Не расстраивайтесь! Напишите 'разбери ошибки' для подробного объяснения.")
 
-
 # Display chat history
 for idx, msg in enumerate(st.session_state.messages):
     if msg['role'] == 'system':
@@ -447,7 +539,6 @@ for idx, msg in enumerate(st.session_state.messages):
     elif msg['role'] == 'test':
         with st.chat_message('assistant'):
             display_test(msg['test_data'], idx)
-
 
 # Handle user input
 user_input = st.chat_input("Например: «тест по квадратным уравнениям»...")
